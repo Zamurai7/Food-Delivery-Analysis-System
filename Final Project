@@ -1,0 +1,339 @@
+# 1. Upload Libraries
+
+library(shiny)
+library(bslib) # Themes
+library(tidyverse) # Organize data
+library(DT) # Manipulate the csv file
+library(factoextra) # k-means
+library(arules) # Association rules
+library(plotly) # Dynamic plots 
+library(echarts4r) # Dynamic & 3D plots
+
+
+# 2. Define algorithm functions (Backend Logic)
+
+# (A) Association Rules
+association_logic_arules <- function(df, min_support, max_len) {
+  
+  # Convert data into transactions
+  df_trans <- df %>% mutate(across(everything(), as.factor))
+  trans <- as(df_trans, "transactions")
+  
+  # Apriori
+  rules <- apriori(trans, 
+                   parameter = list(supp = min_support, 
+                                    conf = 0.1, 
+                                    maxlen = max_len, 
+                                    minlen = 2),
+                   control = list(verbose = FALSE)) # Turns off the progress messages that the algorithm would otherwise print while it runs
+  
+  # Filtering Results
+  target_rule <- "Late_Delivery_Flag=late"
+  
+  if (length(rules) == 0) return(data.frame())
+  
+  rules_late <- subset(rules, rhs %in% target_rule) # subtracts the rules that achieve the condition only
+  
+  if (length(rules_late) > 0) {
+    # Convert the rules object to a data frame
+    res_df <- as(rules_late, "data.frame") 
+    
+    # Cleaning " LHS => RHS "
+    res_df$rules <- as.character(res_df$rules) 
+    parts <- strsplit(res_df$rules, " => ")
+    
+    res_df$LHS <- sapply(parts, "[", 1) 
+    res_df$RHS <- "Late Delivery"       
+    
+    # Organize results
+    res_df <- res_df %>% # Pick and rename the columns to a clean output and keep only rules with Lift > 1
+      select(LHS, RHS, support, confidence, lift) %>%
+      rename(Support = support, Confidence = confidence, Lift = lift) %>%
+      filter(Lift > 1) %>%        
+      arrange(desc(Lift)) # Arrange in descending order       
+    
+    return(res_df)
+  } else {
+    return(data.frame()) 
+  }
+}
+
+# (B) K-means
+kmeans_logic <- function(df, k, nstart, max_iter) {
+  # Choosing the numeric columns
+  numeric_cols <- df %>% 
+    select(Distance_km, Preparation_Time_min, Courier_Experience_yrs, Delivery_Time_min, speed) %>%      
+    na.omit()
+  
+  # Scale Data
+  scaled_data <- scale(numeric_cols)
+  
+  set.seed(123)
+  
+  # Run K-means
+  km_result <- kmeans(scaled_data, centers = k, nstart = nstart, iter.max = max_iter)
+  
+  # Adding resutls 
+  numeric_cols$Cluster <- as.factor(km_result$cluster)
+  
+  return(list(model = km_result, data = numeric_cols, centers = km_result$centers))
+}
+
+# 3. UI
+
+ui = fluidPage(
+  theme = bs_theme(version = 5, bootswatch = "morph", bg = "#F3F4F6", fg = "#1F2937", primary = "#374151"),
+  
+  tags$head(
+    tags$link(href = "https://fonts.googleapis.com/css2?family=Pacifico&display=swap", rel = "stylesheet"),
+    tags$style(HTML(".pacifico-text { font-family: 'Pacifico', cursive; text-align: center; font-size: 2.5em; color: #374151;}")),
+    tags$style(HTML(".nav-tabs { justify-content: center !important; display: flex !important; }")), 
+    tags$style(HTML("table.dataTable { width: 100% !important; }")),
+    tags$style(HTML(".plot-container { background-color: white; padding: 15px; border-radius: 10px; margin-bottom: 20px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }")),
+    tags$style(HTML("table.dataTable th, 
+                                  table.dataTable td { 
+                                    font-size: 10px !important; 
+                                    padding: 6px !important; white-space: normal !important; 
+                                    word-wrap: break-word; 
+                                  } 
+                                  table.dataTable { 
+                                  table-layout: fixed !important; 
+                                  width: 100% !important; }"))
+  ),
+  
+  br(),
+  tags$h1("Food Delivery Analysis System 🍕", class = "pacifico-text"), 
+  br(),
+  
+  sidebarLayout(
+    sidebarPanel(
+      fileInput("file1", "Upload File (.csv)", accept = c(".csv")),
+      
+      tabsetPanel(
+        tabPanel("Control Panel", br(),
+                 h4("1. Clustering (K-means)"),
+                 sliderInput("clusters", "K (Clusters):", 2, 10, 3), 
+                 sliderInput("iterations", "Max Iterations:", 10, 100, 50), 
+                 hr(), 
+                 h4("2. Association Rules"),
+                 sliderInput("support", "Min Support:", 0.001, 0.2, 0.05, 0.001), 
+                 sliderInput("maxlen", "Max Length:", 2, 5, 3), 
+                 br(),
+                 actionButton("run_all", "Run Full Analysis 🚀", class = "btn-success w-100"),
+                 
+                 # === زر Export ===
+                 hr(),
+                 h4("3. Export Results "),
+                 downloadButton("download_clusters", "Clustered Data (.csv)", class = "btn-info w-100"),
+                 br(), br(),
+                 downloadButton("download_rules", "Rules Table (.csv)", class = "btn-warning w-100")
+        )
+      )
+    ),
+    
+    mainPanel(
+      tabsetPanel(
+        tabPanel("Data Preview",
+                 br(),
+                 DTOutput("data_preview")
+        ),
+        
+        tabPanel("Clustering", 
+                 br(),
+                 plotOutput("kmeans_plot", height = "500px"), 
+                 hr(),
+                 h4("Cluster Centers:"),
+                 tableOutput("kmeans_centers") 
+        ),
+        
+        tabPanel("Association Rules",
+                 tabsetPanel(
+                   tabPanel("Table",
+                            tableOutput("rules_table")
+                   ),
+                   tabPanel("Rules", br(),
+                            h4("Top Rules Causing Lateness:"),
+                            verbatimTextOutput("rules_text")
+                   )
+                 )
+        ),
+        
+        tabPanel("Visualization",
+                 tabsetPanel(
+                   tabPanel("Static Charts", 
+                            br(),
+                            fluidRow(
+                              column(6, class = "plot-container", h5("1. Delivery Time Dist."), plotOutput("plot1_hist")),
+                              column(6, class = "plot-container", h5("2. Traffic Levels"), plotOutput("plot2_traffic"))
+                            ),
+                            fluidRow(
+                              column(6, class = "plot-container", h5("3. Distance vs Time"), plotOutput("plot3_dist")),
+                              column(6, class = "plot-container", h5("4. Weather Impact"), plotOutput("plot4_weather"))
+                            ),
+                            fluidRow(
+                              column(6, class = "plot-container", h5("5. Traffic Impact"), plotOutput("plot5_traffic_box")),
+                              column(6, class = "plot-container", h5("6. Vehicle Performance"), plotOutput("plot6_vehicle"))
+                            ),
+                            fluidRow(
+                              column(6, class = "plot-container", h5("7. Experience vs Time"), plotOutput("plot7_exp")),
+                              column(6, class = "plot-container", h5("8. Late Flag Analysis"), plotOutput("plot8_late"))
+                            )
+                   ),
+                   
+                   tabPanel("Dynamic Charts", 
+                            br(),
+                            fluidRow(
+                              column(6, class = "plot-container", h5("Weather Distribution"), echarts4rOutput("dynamic_weather")),
+                              column(6, class = "plot-container", h5("Avg Speed Gauge"), echarts4rOutput("dynamic_gauge"))
+                            ),
+                            fluidRow(
+                              column(12, class = "plot-container", h5("Delivery Time Trend"), echarts4rOutput("dynamic_line"))
+                            )
+                   ),
+                   
+                   tabPanel("3D Analysis", 
+                            br(),
+                            h4("3D Analysis: Distance vs Prep Time vs Delivery Time"),
+                            plotlyOutput("plot_3d", height = "600px")
+                   )
+                 ))
+      )
+    )
+  )
+)
+
+
+# 4. Server
+
+server <- function(input, output) {
+  
+  # Read data
+  raw_data <- reactive({
+    req(input$file1) 
+    # Prevent the app from stopping if the file is corrupted
+    tryCatch({
+      read.csv(input$file1$datapath, stringsAsFactors = FALSE)
+    }, error = function(e) {
+      return(NULL)
+    })
+  })
+  
+  # Data Preview
+  output$data_preview <- DT::renderDT({
+    req(raw_data()) 
+    raw_data()
+  }, options = list(scrollX = TRUE, pageLength = 5))
+  
+  # Analyses
+  analyses <- eventReactive(input$run_all, {
+    req(raw_data()) 
+    df <- raw_data()
+    
+    # Make sure data isn't empty
+    validate(need(nrow(df) > 0, "File is empty!"))
+    
+    # 1. Preparing the rules
+    df_rules <- df %>% mutate(
+      Distance_features = case_when(Distance_km < 5 ~ "Short", Distance_km < 10 ~ "Medium", TRUE ~ "Long"),
+      Preparation_Time_features = case_when(Preparation_Time_min < 10 ~ "Fast", Preparation_Time_min < 20 ~ "Medium", TRUE ~ "Slow"),
+      Courier_Experience_features = case_when(Courier_Experience_yrs < 2 ~ "New", Courier_Experience_yrs < 5 ~ "Exp", TRUE ~ "Veteran")
+    )
+    
+    # 2. Association Rules
+    rules_res <- association_logic_arules(df_rules, input$support, input$maxlen)
+    
+    # 3. K-means
+    kmeans_res <- kmeans_logic(df, input$clusters, 10, input$iterations)
+    
+    list(rules = rules_res, kmeans = kmeans_res)
+  })
+  
+  # Export
+  output$download_clusters <- downloadHandler(
+    filename = function() { paste("Clustered_Data_", Sys.Date(), ".csv", sep = "") },
+    content = function(file) {
+      req(analyses())
+      write.csv(analyses()$kmeans$data, file, row.names = FALSE)
+    }
+  )
+  
+  output$download_rules <- downloadHandler(
+    filename = function() { paste("Rules_Table_", Sys.Date(), ".csv", sep = "") },
+    content = function(file) {
+      req(analyses())
+      write.csv(analyses()$rules, file, row.names = FALSE)
+    }
+  )
+  
+  # Static plots
+  output$plot1_hist <- renderPlot({ req(raw_data()); ggplot(raw_data(), aes(x = Delivery_Time_min)) + geom_histogram(bins=30, fill = "#1f77b4", alpha = 0.8) + theme_minimal() })
+  output$plot2_traffic <- renderPlot({ req(raw_data()); ggplot(raw_data(), aes(x = Traffic_Level, fill = Traffic_Level)) + geom_bar() + theme_minimal() })
+  output$plot3_dist <- renderPlot({ req(raw_data()); ggplot(raw_data(), aes(x = Distance_km, y = Delivery_Time_min)) + geom_point(alpha = 0.6) + geom_smooth(method = "lm") + theme_minimal() })
+  output$plot4_weather <- renderPlot({ req(raw_data()); ggplot(raw_data(), aes(x = Weather, y = Delivery_Time_min, fill = Weather)) + geom_boxplot() + theme_minimal() })
+  output$plot5_traffic_box <- renderPlot({ req(raw_data()); ggplot(raw_data(), aes(x = Traffic_Level, y = Delivery_Time_min, fill = Traffic_Level)) + geom_boxplot() + theme_minimal() })
+  output$plot6_vehicle <- renderPlot({ req(raw_data()); ggplot(raw_data(), aes(x = Vehicle_Type, y = Delivery_Time_min, fill = Vehicle_Type)) + geom_boxplot() + theme_minimal() })
+  output$plot7_exp <- renderPlot({ req(raw_data()); ggplot(raw_data(), aes(x = Courier_Experience_yrs, y = Delivery_Time_min)) + geom_point() + theme_minimal() })
+  output$plot8_late <- renderPlot({ req(raw_data()); ggplot(raw_data(), aes(x = Late_Delivery_Flag, y = Delivery_Time_min, fill = Late_Delivery_Flag)) + geom_boxplot() + theme_minimal() })
+  
+  # 3D plots
+  output$plot_3d <- renderPlotly({
+    req(input$run_all)
+    plot_ly(raw_data(), x = ~Distance_km, y = ~Preparation_Time_min, z = ~Delivery_Time_min, 
+            color = ~Late_Delivery_Flag, colors = c('#FF0000', '#00CC00'), size = 3) %>%
+      add_markers()
+  })
+  
+  # Dynamic plots
+  output$dynamic_weather <- renderEcharts4r({
+    req(input$run_all)
+    raw_data() %>% group_by(Weather) %>% summarise(Count = n()) %>% 
+      e_charts(Weather) %>% e_bar(Count) %>% e_tooltip()
+  })
+  
+  output$dynamic_gauge <- renderEcharts4r({
+    req(input$run_all)
+    avg_speed <- round(mean(raw_data()$speed, na.rm=TRUE) * 10, 1)
+    e_charts() %>% e_gauge(avg_speed, "Avg Speed")
+  })
+  
+  output$dynamic_line <- renderEcharts4r({
+    req(input$run_all)
+    raw_data() %>% group_by(Time_of_Day) %>% summarise(Avg_Time = mean(Delivery_Time_min)) %>%
+      e_charts(Time_of_Day) %>% e_line(Avg_Time) %>% e_tooltip()
+  })
+  
+  # Outputs
+  output$kmeans_plot <- renderPlot({ 
+    req(analyses())
+    res <- analyses()$kmeans
+    fviz_cluster(res$model, data = res$data %>% select(-Cluster), geom = "point") 
+  })
+  
+  output$kmeans_centers <- renderTable({ 
+    req(analyses())
+    analyses()$kmeans$centers 
+  }, rownames = TRUE)
+  
+  output$rules_table <- renderTable({ 
+    req(analyses())
+    analyses()$rules 
+  }, digits = 3)
+  
+  output$rules_text <- renderPrint({
+    req(analyses())
+    rules <- analyses()$rules
+    
+    # Loading bar
+    validate(need(is.data.frame(rules), "Please Wait 🛺..."))
+    
+    # Organize arules
+    if (nrow(rules) > 0) {
+      top <- utils::head(rules, 10)
+      for (i in 1:nrow(top)) { cat(sprintf("Rule #%d: IF [%s] THEN Late (Lift: %.2f)\n", i, top[i, "LHS"], top[i, "Lift"])) }
+    } else { 
+      cat("No strong rules found with current support/confidence levels.") 
+    }
+  })
+}
+
+shinyApp(ui, server)
